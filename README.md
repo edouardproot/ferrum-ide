@@ -1,4 +1,4 @@
-# Rust TUI IDE
+#ferrum
 
 A terminal-based IDE built into a Rust application. It combines a simple,
 non-modal editor with a file explorer, tabs, Rust syntax highlighting, cargo tasks,
