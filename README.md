@@ -54,7 +54,7 @@ There is also an `install.sh` helper:
 ```
 
 Prebuilt binaries are attached to GitHub Releases when a `v*` tag is pushed or when a Release is published from the web interface.
-The `release.yml` workflow builds Linux, Windows, macOS Intel, and macOS Apple Silicon binaries.
+The `.github/workflows/workflow.yaml` workflow builds Linux, Windows, macOS Intel, and macOS Apple Silicon binaries.
 
 GitHub also generates its own `Source code (zip)` and `Source code (tar.gz)` archives. Those are not the Ferrum binaries. Look under **Assets** for `ferrum-*.tar.gz` and `ferrum-*.zip`.
 
@@ -90,6 +90,7 @@ The editor starts in insert mode: just type. Letters are never commands.
 | `Ctrl+Space` | Request LSP completions (in insert mode) |
 | `Ctrl+]` | Go to definition (LSP) |
 | `Ctrl+V` | Visual selection (`Ctrl+Y` copy, `Ctrl+D` cut) |
+| `Ctrl+S` | Save current file |
 | `Ctrl+Q` | Quit when the buffer is unmodified |
 | `Esc` | Leave insert mode / return to editor from a side panel / dismiss completions |
 | `Enter`, `Insert` | Enter insert mode from normal mode |
@@ -141,7 +142,7 @@ In the terminal panel: type normally and press `Esc` to return to the editor.
 .
 ├── .github
 │   └── workflows
-│       └── release.yml
+│       └── workflow.yaml
 ├── .gitignore
 ├── Cargo.lock
 ├── Cargo.toml

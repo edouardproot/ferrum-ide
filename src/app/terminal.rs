@@ -36,6 +36,9 @@ impl TerminalPane {
             error: None,
         };
 
+        #[cfg(windows)]
+        let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+        #[cfg(not(windows))]
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
@@ -139,12 +142,10 @@ impl TerminalPane {
         }
     }
 
-    pub fn write_str(&mut self, text: &str) -> bool {
+    pub fn write_bytes(&mut self, bytes: &[u8]) -> bool {
         match &mut self.writer {
             Some(writer) => {
-                let result = writer
-                    .write_all(text.as_bytes())
-                    .and_then(|_| writer.flush());
+                let result = writer.write_all(bytes).and_then(|_| writer.flush());
                 if result.is_err() {
                     self.error = Some("terminal write failed".to_string());
                     false
@@ -165,7 +166,10 @@ impl TerminalPane {
                     .modifiers
                     .intersects(KeyModifiers::ALT | KeyModifiers::SUPER | KeyModifiers::META)
                 {
-                    Some(vec![0x1b, ch as u8])
+                    let mut seq = vec![0x1b];
+                    let mut buf = [0u8; 4];
+                    seq.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                    Some(seq)
                 } else {
                     Some(ch.to_string().into_bytes())
                 }
@@ -186,7 +190,7 @@ impl TerminalPane {
         };
 
         match bytes {
-            Some(bytes) => self.write_str(&String::from_utf8_lossy(&bytes)),
+            Some(bytes) => self.write_bytes(&bytes),
             None => true,
         }
     }

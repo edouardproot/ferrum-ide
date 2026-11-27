@@ -10,7 +10,7 @@ use super::{syntax, ActivePanel, App, AppMode, Severity};
 
 pub fn render(frame: &mut Frame, app: &App) {
     if app.mode == AppMode::HelpMenu {
-        render_help(frame, frame.area());
+        render_help(frame, frame.area(), app);
         return;
     }
 
@@ -40,10 +40,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     let content = right[1];
 
     match app.active_panel {
-        ActivePanel::Editor => render_editor(frame, content, app),
-        ActivePanel::Explorer => {
-            render_explorer(frame, content, app, true);
-        }
+        ActivePanel::Editor | ActivePanel::Explorer => render_editor(frame, content, app),
         ActivePanel::Terminal => render_terminal(frame, content, app),
         ActivePanel::Output => render_task_output(frame, content, app),
         ActivePanel::Problems => render_problems(frame, content, app),
@@ -163,28 +160,152 @@ fn render_tabbar(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
 
 fn diagnostic_marker(app: &App, line_index: usize) -> Option<Severity> {
     let name = app.file_name.as_deref()?;
-    app.diagnostics
-        .iter()
-        .find(|diagnostic| {
-            diagnostic.line == line_index + 1 && diagnostic.path.to_string_lossy() == name
-        })
-        .map(|diagnostic| diagnostic.severity)
+    let active_path = super::normalize_path(&app.project_root(), std::path::Path::new(name));
+    let mut worst: Option<Severity> = None;
+    for diagnostic in &app.diagnostics {
+        if diagnostic.line == line_index + 1 && super::path_matches(&diagnostic.path, &active_path)
+        {
+            worst = match (worst, diagnostic.severity) {
+                (Some(Severity::Error), _) | (_, Severity::Error) => Some(Severity::Error),
+                (Some(Severity::Warning), _) | (_, Severity::Warning) => Some(Severity::Warning),
+                _ => Some(Severity::Other),
+            };
+        }
+    }
+    worst
+}
+
+fn gutter_span(
+    i: usize,
+    is_cursor: bool,
+    is_visual: bool,
+    marker: Option<Severity>,
+) -> Span<'static> {
+    let marker_char = if marker.is_some() { '●' } else { ' ' };
+    let (fg, bg, modifier) = if is_visual {
+        (Color::White, Color::Rgb(50, 50, 150), Modifier::REVERSED)
+    } else if is_cursor {
+        (Color::Yellow, Color::Reset, Modifier::BOLD)
+    } else {
+        let fg = match marker {
+            Some(Severity::Error) => Color::Red,
+            Some(Severity::Warning) => Color::Yellow,
+            _ => Color::DarkGray,
+        };
+        (fg, Color::Reset, Modifier::empty())
+    };
+    Span::styled(
+        format!("{}{:>4} │ ", marker_char, i + 1),
+        Style::default().fg(fg).bg(bg).add_modifier(modifier),
+    )
+}
+
+fn render_editor_line_content(
+    line: &str,
+    is_cursor_line: bool,
+    is_visual_line: bool,
+    app: &App,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    if is_cursor_line && app.mode != AppMode::Visual {
+        let col = super::floor_char_boundary(line, app.cursor.1);
+        spans.extend(syntax::highlight(&line[..col]));
+        match line[col..].chars().next() {
+            Some(ch) => {
+                spans.push(Span::styled(
+                    ch.to_string(),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::White)
+                        .add_modifier(Modifier::REVERSED),
+                ));
+                let after_col = col + ch.len_utf8();
+                spans.extend(syntax::highlight(&line[after_col..]));
+            }
+            None => spans.push(Span::styled(
+                "▌",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::REVERSED),
+            )),
+        }
+    } else if is_visual_line {
+        let text = if line.is_empty() {
+            " ".to_string()
+        } else {
+            line.to_string()
+        };
+        spans.push(Span::styled(
+            text,
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Rgb(50, 50, 150))
+                .add_modifier(Modifier::REVERSED),
+        ));
+    } else {
+        spans.extend(syntax::highlight(line));
+    }
+    spans
 }
 
 fn render_editor(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+    let (visual_start, visual_end) = if app.mode == AppMode::Visual {
+        app.get_visual_range()
+    } else {
+        (0, usize::MAX)
+    };
+
+    if app.word_wrap {
+        let (start, end) = visible_range(app, area.height as usize);
+        let text_lines: Vec<Line> = app
+            .text_buffer
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(end - start)
+            .map(|(i, line)| {
+                let is_cursor_line = i == app.cursor.0;
+                let is_visual_line =
+                    i >= visual_start && i <= visual_end && app.mode == AppMode::Visual;
+                let marker = diagnostic_marker(app, i);
+                let mut spans = Vec::new();
+                if app.show_line_numbers {
+                    spans.push(gutter_span(i, is_cursor_line, is_visual_line, marker));
+                } else if let Some(severity) = marker {
+                    let color = match severity {
+                        Severity::Error => Color::Red,
+                        Severity::Warning => Color::Yellow,
+                        Severity::Other => Color::Gray,
+                    };
+                    spans.push(Span::styled("● ", Style::default().fg(color)));
+                }
+                spans.extend(render_editor_line_content(
+                    line,
+                    is_cursor_line,
+                    is_visual_line,
+                    app,
+                ));
+                Line::from(spans)
+            })
+            .collect();
+
+        let paragraph = Paragraph::new(text_lines)
+            .block(Block::default())
+            .wrap(Wrap { trim: false });
+        frame.render_widget(paragraph, area);
+        if !app.show_line_numbers {
+            frame.render_widget(Block::default().borders(Borders::LEFT), area);
+        }
+        return;
+    }
+
     let (text_area, has_line_numbers) = if app.show_line_numbers {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(6), Constraint::Min(0)])
+            .constraints([Constraint::Length(8), Constraint::Min(0)])
             .split(area);
 
         let (start, end) = visible_range(app, chunks[1].height as usize);
-        let (visual_start, visual_end) = if app.mode == AppMode::Visual {
-            app.get_visual_range()
-        } else {
-            (0, usize::MAX)
-        };
-
         let line_numbers: Vec<Line> = app
             .text_buffer
             .iter()
@@ -195,22 +316,7 @@ fn render_editor(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                 let is_cursor = i == app.cursor.0;
                 let is_visual = i >= visual_start && i <= visual_end && app.mode == AppMode::Visual;
                 let marker = diagnostic_marker(app, i);
-                let (fg, bg, modifier) = if is_visual {
-                    (Color::White, Color::Rgb(50, 50, 150), Modifier::REVERSED)
-                } else if is_cursor {
-                    (Color::Yellow, Color::Reset, Modifier::BOLD)
-                } else {
-                    let fg = match marker {
-                        Some(Severity::Error) => Color::Red,
-                        Some(Severity::Warning) => Color::Yellow,
-                        _ => Color::DarkGray,
-                    };
-                    (fg, Color::Reset, Modifier::empty())
-                };
-                Line::from(Span::styled(
-                    format!("{:>4} │", i + 1),
-                    Style::default().fg(fg).bg(bg).add_modifier(modifier),
-                ))
+                Line::from(gutter_span(i, is_cursor, is_visual, marker))
             })
             .collect();
 
@@ -224,12 +330,6 @@ fn render_editor(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     };
 
     let (start, end) = visible_range(app, text_area.height as usize);
-    let (visual_start, visual_end) = if app.mode == AppMode::Visual {
-        app.get_visual_range()
-    } else {
-        (0, usize::MAX)
-    };
-
     let text_lines: Vec<Line> = app
         .text_buffer
         .iter()
@@ -237,80 +337,44 @@ fn render_editor(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         .skip(start)
         .take(end - start)
         .map(|(i, line)| {
-            let mut spans: Vec<Span<'static>> = Vec::new();
-            if let Some(severity) = diagnostic_marker(app, i) {
-                let color = match severity {
-                    Severity::Error => Color::Red,
-                    Severity::Warning => Color::Yellow,
-                    Severity::Other => Color::Gray,
-                };
-                spans.push(Span::styled("● ", Style::default().fg(color)));
+            let mut spans = Vec::new();
+            if !has_line_numbers {
+                if let Some(severity) = diagnostic_marker(app, i) {
+                    let color = match severity {
+                        Severity::Error => Color::Red,
+                        Severity::Warning => Color::Yellow,
+                        Severity::Other => Color::Gray,
+                    };
+                    spans.push(Span::styled("● ", Style::default().fg(color)));
+                }
             }
-
             let is_cursor_line = i == app.cursor.0;
             let is_visual_line =
                 i >= visual_start && i <= visual_end && app.mode == AppMode::Visual;
-
-            if is_cursor_line && app.mode != AppMode::Visual {
-                let col = super::floor_char_boundary(line, app.cursor.1);
-                spans.extend(syntax::highlight(&line[..col]));
-                match line[col..].chars().next() {
-                    Some(ch) => {
-                        spans.push(Span::styled(
-                            ch.to_string(),
-                            Style::default()
-                                .fg(Color::Black)
-                                .bg(Color::White)
-                                .add_modifier(Modifier::REVERSED),
-                        ));
-                        let after_col = col + ch.len_utf8();
-                        spans.extend(syntax::highlight(&line[after_col..]));
-                    }
-                    None => spans.push(Span::styled(
-                        "▌",
-                        Style::default()
-                            .fg(Color::White)
-                            .add_modifier(Modifier::REVERSED),
-                    )),
-                }
-            } else if is_visual_line {
-                let (start_col, end_col) = if i == visual_start && i == visual_end {
-                    (
-                        app.visual_start.1.min(app.cursor.1),
-                        app.visual_start.1.max(app.cursor.1),
-                    )
-                } else if i == visual_start {
-                    (app.visual_start.1, line.len())
-                } else if i == visual_end {
-                    (0, app.cursor.1)
-                } else {
-                    (0, line.len())
-                };
-                let start_col = super::floor_char_boundary(line, start_col);
-                let end_col = super::floor_char_boundary(line, end_col);
-                spans.extend(syntax::highlight(&line[..start_col]));
-                spans.push(Span::styled(
-                    line[start_col..end_col].to_string(),
-                    Style::default()
-                        .fg(Color::White)
-                        .bg(Color::Rgb(50, 50, 150))
-                        .add_modifier(Modifier::REVERSED),
-                ));
-                spans.extend(syntax::highlight(&line[end_col..]));
-            } else {
-                spans.extend(syntax::highlight(line.as_str()));
-            }
-
+            spans.extend(render_editor_line_content(
+                line,
+                is_cursor_line,
+                is_visual_line,
+                app,
+            ));
             Line::from(spans)
         })
         .collect();
 
-    let paragraph = Paragraph::new(text_lines).block(Block::default());
-    let paragraph = if app.word_wrap {
-        paragraph.wrap(Wrap { trim: false })
-    } else {
-        paragraph
-    };
+    let cursor_col_chars = app
+        .text_buffer
+        .get(app.cursor.0)
+        .map(|line| {
+            let boundary = super::floor_char_boundary(line, app.cursor.1);
+            line[..boundary].chars().count()
+        })
+        .unwrap_or(0);
+    let visible_width = (text_area.width as usize).max(1);
+    let horiz_scroll = cursor_col_chars.saturating_sub(visible_width.saturating_sub(2)) as u16;
+
+    let paragraph = Paragraph::new(text_lines)
+        .block(Block::default())
+        .scroll((0, horiz_scroll));
     frame.render_widget(paragraph, text_area);
 
     if !has_line_numbers {
@@ -398,6 +462,8 @@ fn render_problems(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             })
             .collect()
     };
+    let height = area.height.saturating_sub(2) as usize;
+    let offset = app.problem_index.saturating_sub(height / 2) as u16;
     let paragraph = Paragraph::new(lines)
         .block(
             Block::default()
@@ -405,6 +471,7 @@ fn render_problems(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                 .border_style(Style::default().fg(Color::Cyan))
                 .title(format!(" Problems ({}) ", app.diagnostics.len())),
         )
+        .scroll((offset, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
@@ -443,10 +510,6 @@ fn render_git(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
 
 fn render_panel(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     let (title, lines) = match app.active_panel {
-        ActivePanel::Output => (
-            " Output — Tab to cycle, Esc for editor ",
-            app.task_output.lines().map(Line::from).collect::<Vec<_>>(),
-        ),
         ActivePanel::History => (
             " Command history — Tab to cycle, Esc for editor ",
             app.command_history
@@ -501,7 +564,14 @@ fn render_status_line(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
     };
 
     let cursor_line = app.cursor.0 + 1;
-    let cursor_col = app.cursor.1 + 1;
+    let cursor_col = app
+        .text_buffer
+        .get(app.cursor.0)
+        .map(|line| {
+            let boundary = super::floor_char_boundary(line, app.cursor.1);
+            line[..boundary].chars().count() + 1
+        })
+        .unwrap_or(1);
     let total_lines = app.line_count;
     let percentage = (cursor_line.saturating_mul(100) / total_lines.max(1)).min(100);
     let position_str = if cursor_line == total_lines && total_lines > 0 {
@@ -608,7 +678,7 @@ fn render_completions(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
             } else {
                 Style::default().fg(Color::White)
             };
-            Line::from(Span::styled(item.clone(), style))
+            Line::from(Span::styled(item.label.clone(), style))
         })
         .collect();
     let paragraph = Paragraph::new(lines)
@@ -622,7 +692,7 @@ fn render_completions(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
     frame.render_widget(paragraph, popup);
 }
 
-fn render_help(frame: &mut Frame, area: ratatui::layout::Rect) {
+fn render_help(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     let window_width = 78;
     let window_height = 38;
     let x = (area.width.saturating_sub(window_width)) / 2;
@@ -641,13 +711,13 @@ fn render_help(frame: &mut Frame, area: ratatui::layout::Rect) {
 
     let help_text = vec![
         Line::from(Span::styled(
-            "  Rust IDE (TUI) — Help",
+            "  Ferrum IDE — Help",
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(Span::styled("  PANELS:", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
         Line::from("    Tab           — Cycle editor / explorer / terminal / output / problems / git / history"),
-        Line::from("    Ctrl+E         — File explorer (arrows, Enter, Left/Right, Space, F5)"),
+        Line::from("    Ctrl+E         — File explorer (Arrows/j/k, Enter, Left/Right, Space, F5)"),
         Line::from("    Ctrl+T         — Integrated terminal (Esc returns)"),
         Line::from("    Ctrl+P         — Problems panel"),
         Line::from("    Ctrl+G         — Refresh git status"),
@@ -665,6 +735,7 @@ fn render_help(frame: &mut Frame, area: ratatui::layout::Rect) {
         Line::from("    :hover         — Hover information in output panel"),
         Line::from(""),
         Line::from(Span::styled("  BUFFERS & FILES:", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+        Line::from("    Ctrl+S / :w    — Save current buffer"),
         Line::from("    :e {file}      — Open file in a new tab"),
         Line::from("    :tabnew        — New empty buffer"),
         Line::from("    :tabnext/:tabprev — Switch buffers"),
@@ -674,11 +745,11 @@ fn render_help(frame: &mut Frame, area: ratatui::layout::Rect) {
         Line::from(Span::styled("  EDITOR:", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
         Line::from("    No plain-letter keys are commands; type directly."),
         Line::from("    Arrows/Home/End— Move cursor"),
-        Line::from("    Enter / Insert — Start typing (Esc returns to normal mode)"),
+        Line::from("    Enter / Insert — Enter insert mode (Esc leaves insert mode for : / search)"),
         Line::from("    Ctrl+V         — Visual selection; Ctrl+Y copy, Ctrl+D cut"),
-        Line::from("    /pattern       — Search; F3 / Shift+F3 next/previous"),
-        Line::from("    :w/:wq/:q      — Save / save+quit / quit (no quit if write fails)"),
-        Line::from("    :help          — This help"),
+        Line::from("    /pattern       — Search (in normal mode); F3 / Shift+F3 next/previous"),
+        Line::from("    :w/:wq/:q      — Save / save+quit / quit (in normal mode)"),
+        Line::from("    :help          — This help (Up/Down scrolls, Esc/Enter closes)"),
         Line::from(""),
         Line::from("    Ctrl+Q quits (Esc returns to the editor)."),
     ];
@@ -690,6 +761,7 @@ fn render_help(frame: &mut Frame, area: ratatui::layout::Rect) {
                 .border_style(Style::default().fg(Color::Yellow))
                 .title(" Help "),
         )
+        .scroll((app.help_scroll as u16, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, window_area);
 }

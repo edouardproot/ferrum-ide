@@ -80,7 +80,7 @@ impl Explorer {
             .collect();
 
         self.entries.clear();
-        self.collect(&self.root.clone(), 0, &expanded, 0);
+        self.collect(&self.root.clone(), 0, &expanded);
         if self.entries.is_empty() {
             self.entries.push(ExplorerEntry {
                 path: self.root.clone(),
@@ -92,8 +92,8 @@ impl Explorer {
         self.selected = self.selected.min(self.entries.len().saturating_sub(1));
     }
 
-    fn collect(&mut self, dir: &Path, depth: usize, expanded: &HashSet<PathBuf>, guard: usize) {
-        if depth > 8 || guard > 4000 {
+    fn collect(&mut self, dir: &Path, depth: usize, expanded: &HashSet<PathBuf>) {
+        if depth > 8 || self.entries.len() > 4000 {
             return;
         }
 
@@ -105,9 +105,10 @@ impl Explorer {
         for entry in read_dir.flatten() {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.')
-                || matches!(name.as_str(), "target" | "node_modules" | "__pycache__")
-            {
+            if matches!(
+                name.as_str(),
+                ".git" | "target" | "node_modules" | "__pycache__"
+            ) {
                 continue;
             }
             let Ok(file_type) = entry.file_type() else {
@@ -121,6 +122,9 @@ impl Explorer {
         });
 
         for (_, path, is_dir) in children {
+            if self.entries.len() > 4000 {
+                break;
+            }
             let is_expanded = is_dir && expanded.contains(&path);
             self.entries.push(ExplorerEntry {
                 path: path.clone(),
@@ -129,7 +133,7 @@ impl Explorer {
                 expanded: is_expanded,
             });
             if is_expanded {
-                self.collect(&path, depth + 1, expanded, guard + 1);
+                self.collect(&path, depth + 1, expanded);
             }
         }
     }

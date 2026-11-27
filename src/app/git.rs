@@ -11,7 +11,18 @@ pub fn status(cwd: &Path) -> (String, Vec<String>) {
         Ok(output) if output.status.success() => {
             String::from_utf8_lossy(&output.stdout).trim().to_string()
         }
-        _ => "(no git repository)".to_string(),
+        _ => {
+            let sym_output = Command::new("git")
+                .args(["symbolic-ref", "--short", "HEAD"])
+                .current_dir(cwd)
+                .output();
+            match sym_output {
+                Ok(output) if output.status.success() => {
+                    String::from_utf8_lossy(&output.stdout).trim().to_string()
+                }
+                _ => "(no git repository)".to_string(),
+            }
+        }
     };
 
     let output = Command::new("git")
@@ -37,8 +48,8 @@ pub fn status(cwd: &Path) -> (String, Vec<String>) {
     let lines = text
         .lines()
         .map(|line| {
-            let status = &line[..line.len().min(2)];
-            let path = line.get(3..).unwrap_or("");
+            let status: String = line.chars().take(2).collect();
+            let path = line.get(status.len() + 1..).unwrap_or("");
             format!("{} {}", status.trim_end(), path)
         })
         .filter(|line| !line.trim().is_empty())

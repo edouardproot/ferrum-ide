@@ -38,6 +38,7 @@ impl LspClient {
         let analyzer =
             std::env::var("RUST_ANALYZER").unwrap_or_else(|_| "rust-analyzer".to_string());
         let mut child = Command::new(&analyzer)
+            .current_dir(root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -68,8 +69,10 @@ impl LspClient {
                     if trimmed.is_empty() {
                         break;
                     }
-                    if let Some(value) = trimmed.strip_prefix("Content-Length:") {
-                        content_length = value.trim().parse::<usize>().ok();
+                    if trimmed.len() >= "content-length:".len()
+                        && trimmed[..15].eq_ignore_ascii_case("content-length:")
+                    {
+                        content_length = trimmed[15..].trim().parse::<usize>().ok();
                     }
                 }
 
@@ -216,6 +219,10 @@ impl LspClient {
         }
     }
 
+    pub fn has_opened(&self, path: &Path) -> bool {
+        self.versions.contains_key(&uri(path))
+    }
+
     pub fn did_open(&mut self, path: &Path, text: &str) -> Result<(), String> {
         let key = uri(path);
         self.versions.insert(key.clone(), 1);
@@ -235,6 +242,9 @@ impl LspClient {
 
     pub fn did_change(&mut self, path: &Path, text: &str) -> Result<(), String> {
         let key = uri(path);
+        if !self.versions.contains_key(&key) {
+            return self.did_open(path, text);
+        }
         let version = self.versions.entry(key.clone()).or_insert(0);
         *version += 1;
         let version = *version;
@@ -346,10 +356,26 @@ pub fn path_from_uri(value: &str) -> Option<PathBuf> {
 }
 
 pub fn byte_col_to_utf16(line: &str, byte_col: usize) -> usize {
-    let col = byte_col.min(line.len());
-    let mut boundary = 0;
-    while boundary < col && !line.is_char_boundary(boundary) {
-        boundary += 1;
-    }
+    let boundary = super::floor_char_boundary(line, byte_col);
     line[..boundary].encode_utf16().count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn byte_col_to_utf16_handles_ascii_and_multibyte_offsets() {
+        let line = "let s = \"é🦀\";";
+        assert_eq!(byte_col_to_utf16(line, 0), 0);
+        assert_eq!(byte_col_to_utf16(line, 4), 4);
+        let after_e = "let s = \"é".len();
+        assert_eq!(byte_col_to_utf16(line, after_e), 10);
+        let after_crab = "let s = \"é🦀".len();
+        // '🦀' is a surrogate pair in UTF-16 (2 code units).
+        assert_eq!(byte_col_to_utf16(line, after_crab), 12);
+        // Mid-character byte index floors to the character boundary.
+        assert_eq!(byte_col_to_utf16(line, after_crab - 1), 10);
+        assert_eq!(byte_col_to_utf16(line, 999), line.encode_utf16().count());
+    }
 }

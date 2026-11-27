@@ -11,7 +11,7 @@ mod workspace;
 use lsp::{LspClient, LspMessage};
 use printer::{TextFormat, TextPrinter};
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tasks::{TaskEvent, TaskKind, TaskRunner};
 use terminal::TerminalPane;
 use workspace::{EditorBuffer, Explorer};
@@ -66,6 +66,14 @@ pub struct PendingLsp {
     pub kind: LspRequestKind,
 }
 
+#[derive(Debug, Clone)]
+pub struct CompletionOption {
+    pub label: String,
+    pub insert_text: String,
+    pub replace_start_utf16: Option<usize>,
+    pub replace_end_utf16: Option<usize>,
+}
+
 pub struct App {
     pub running: bool,
     pub mode: AppMode,
@@ -95,6 +103,8 @@ pub struct App {
     pub yank_buffer: Vec<String>,
     pub scroll_offset: usize,
     pub trailing_newline: bool,
+    pub revision: u64,
+    pub help_scroll: usize,
 
     pub explorer: Explorer,
     pub buffers: Vec<EditorBuffer>,
@@ -109,7 +119,7 @@ pub struct App {
     pub lsp: Option<LspClient>,
     pub lsp_error: Option<String>,
     pub pending_lsp: Option<PendingLsp>,
-    pub completions: Vec<String>,
+    pub completions: Vec<CompletionOption>,
     pub completion_index: usize,
     pub problem_index: usize,
 }
@@ -128,6 +138,60 @@ fn ceil_char_boundary(s: &str, idx: usize) -> usize {
         idx += 1;
     }
     idx
+}
+
+pub(crate) fn utf16_col_to_byte(line: &str, utf16_col: usize) -> usize {
+    let mut units = 0usize;
+    for (byte_idx, ch) in line.char_indices() {
+        if units >= utf16_col {
+            return byte_idx;
+        }
+        units += ch.len_utf16();
+    }
+    line.len()
+}
+
+pub(crate) fn char_col_to_byte(line: &str, char_col: usize) -> usize {
+    line.char_indices()
+        .nth(char_col)
+        .map(|(idx, _)| idx)
+        .unwrap_or(line.len())
+}
+
+pub(crate) fn normalize_path(base: &Path, path: &Path) -> PathBuf {
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    };
+    let mut out = PathBuf::new();
+    for comp in joined.components() {
+        match comp {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if matches!(
+                    out.components().next_back(),
+                    Some(std::path::Component::Normal(_))
+                ) {
+                    out.pop();
+                } else if !out.has_root() {
+                    out.push(comp);
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+pub(crate) fn path_matches(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
+    }
 }
 
 #[allow(dead_code)]
@@ -204,6 +268,8 @@ impl App {
             yank_buffer: Vec::new(),
             scroll_offset: 0,
             trailing_newline: true,
+            revision: 0,
+            help_scroll: 0,
 
             explorer: Explorer::new(root),
             buffers: vec![EditorBuffer::untitled()],
@@ -246,6 +312,12 @@ impl App {
         self.char_count = self.text_buffer.iter().map(|l| l.chars().count()).sum();
     }
 
+    fn mark_edited(&mut self) {
+        self.modified = true;
+        self.revision = self.revision.wrapping_add(1);
+        self.update_counts();
+    }
+
     pub fn insert_at_cursor(&mut self, ch: char) {
         let (line, col) = self.cursor;
         if line < self.text_buffer.len() {
@@ -253,13 +325,11 @@ impl App {
             let col = floor_char_boundary(line_str, col);
             line_str.insert(col, ch);
             self.cursor.1 = col + ch.len_utf8();
-            self.modified = true;
-            self.update_counts();
+            self.mark_edited();
         } else {
             self.text_buffer.push(String::from(ch));
             self.cursor = (line, ch.len_utf8());
-            self.modified = true;
-            self.update_counts();
+            self.mark_edited();
         }
     }
 
@@ -281,8 +351,7 @@ impl App {
             self.text_buffer.push(String::new());
             self.cursor = (line, 0);
         }
-        self.modified = true;
-        self.update_counts();
+        self.mark_edited();
     }
 
     fn get_indent(&self, line: &str) -> String {
@@ -312,8 +381,7 @@ impl App {
             self.text_buffer.insert(line, indent.clone());
             self.cursor = (line, indent.len());
         }
-        self.modified = true;
-        self.update_counts();
+        self.mark_edited();
     }
 
     pub fn delete_at_cursor(&mut self) {
@@ -324,13 +392,11 @@ impl App {
         let col = floor_char_boundary(&self.text_buffer[line], col);
         if col < self.text_buffer[line].len() {
             self.text_buffer[line].remove(col);
-            self.modified = true;
-            self.update_counts();
+            self.mark_edited();
         } else if line + 1 < self.text_buffer.len() {
             let next = self.text_buffer.remove(line + 1);
             self.text_buffer[line].push_str(&next);
-            self.modified = true;
-            self.update_counts();
+            self.mark_edited();
         }
     }
 
@@ -339,12 +405,12 @@ impl App {
         if line >= self.text_buffer.len() {
             return;
         }
+        let col = floor_char_boundary(&self.text_buffer[line], col);
         if col > 0 {
             let prev = floor_char_boundary(&self.text_buffer[line], col - 1);
             self.text_buffer[line].remove(prev);
             self.cursor.1 = prev;
-            self.modified = true;
-            self.update_counts();
+            self.mark_edited();
         } else if line > 0 {
             let prev = self.text_buffer[line - 1].clone();
             let current = self.text_buffer[line].clone();
@@ -352,8 +418,7 @@ impl App {
             self.text_buffer[line - 1] = format!("{}{}", prev, current);
             self.cursor.1 = prev.len();
             self.cursor.0 -= 1;
-            self.modified = true;
-            self.update_counts();
+            self.mark_edited();
         }
     }
 
@@ -373,9 +438,13 @@ impl App {
 
     pub fn move_cursor_left(&mut self) {
         let (line, col) = self.cursor;
-        if col > 0 {
-            if line < self.text_buffer.len() {
+        if line < self.text_buffer.len() {
+            let col = floor_char_boundary(&self.text_buffer[line], col);
+            if col > 0 {
                 self.cursor.1 = floor_char_boundary(&self.text_buffer[line], col - 1);
+            } else if line > 0 {
+                self.cursor.0 -= 1;
+                self.cursor.1 = self.text_buffer[self.cursor.0].len();
             }
         } else if line > 0 {
             self.cursor.0 -= 1;
@@ -639,8 +708,7 @@ impl App {
             self.text_buffer.insert(line + i, yanked_line.clone());
         }
         self.cursor = (line, 0);
-        self.modified = true;
-        self.update_counts();
+        self.mark_edited();
         self.set_status("Pasted from register");
     }
 
@@ -654,8 +722,7 @@ impl App {
             self.text_buffer.insert(line + i, yanked_line.clone());
         }
         self.cursor.0 = line;
-        self.modified = true;
-        self.update_counts();
+        self.mark_edited();
         self.set_status("Pasted before cursor");
     }
 
@@ -673,8 +740,7 @@ impl App {
         }
         self.cursor.0 = self.cursor.0.min(self.text_buffer.len() - 1);
         self.cursor.1 = 0;
-        self.modified = true;
-        self.update_counts();
+        self.mark_edited();
         self.set_status("1 line deleted");
     }
 
@@ -692,8 +758,7 @@ impl App {
         }
         self.cursor.0 = self.cursor.0.min(self.text_buffer.len() - 1);
         self.cursor.1 = 0;
-        self.modified = true;
-        self.update_counts();
+        self.mark_edited();
     }
 
     #[allow(dead_code)]
@@ -743,8 +808,7 @@ impl App {
         line_str.replace_range(start..end, "");
         self.yank_buffer = vec![yanked];
         self.cursor.1 = start;
-        self.modified = true;
-        self.update_counts();
+        self.mark_edited();
     }
 
     pub fn delete_visual(&mut self) {
@@ -763,8 +827,7 @@ impl App {
         }
         self.cursor.0 = start_line.min(self.text_buffer.len() - 1);
         self.cursor.1 = 0;
-        self.modified = true;
-        self.update_counts();
+        self.mark_edited();
     }
 
     #[allow(dead_code)]
@@ -774,8 +837,7 @@ impl App {
             self.text_buffer
                 .insert(line + 1, self.text_buffer[line].clone());
             self.cursor.0 += 1;
-            self.modified = true;
-            self.update_counts();
+            self.mark_edited();
         }
     }
 
@@ -786,7 +848,7 @@ impl App {
             let original_col = self.cursor.1;
             self.text_buffer[line].insert_str(0, &indent);
             self.cursor.1 = indent.len() + original_col;
-            self.modified = true;
+            self.mark_edited();
         }
     }
 
@@ -799,7 +861,7 @@ impl App {
             if remove > 0 {
                 line_str.drain(0..remove);
                 self.cursor.1 = self.cursor.1.saturating_sub(remove);
-                self.modified = true;
+                self.mark_edited();
             }
         }
     }
@@ -809,35 +871,48 @@ impl App {
         if line >= self.text_buffer.len() {
             return false;
         }
-        let before = self.text_buffer[line].clone();
-        let after = if global {
-            before.replace(pattern, replacement)
-        } else {
-            before.replacen(pattern, replacement, 1)
-        };
-        let changed = after != before;
-        if changed {
-            self.text_buffer[line] = after;
-            self.cursor.1 = self.cursor.1.min(self.text_buffer[line].len());
-            self.modified = true;
-            self.update_counts();
-        }
-        changed
+        self.substitute_range(line, line, pattern, replacement, global)
     }
 
-    pub fn substitute_all(&mut self, pattern: &str, replacement: &str) -> bool {
+    pub fn substitute_all(&mut self, pattern: &str, replacement: &str, global: bool) -> bool {
+        if self.text_buffer.is_empty() {
+            return false;
+        }
+        self.substitute_range(0, self.text_buffer.len() - 1, pattern, replacement, global)
+    }
+
+    pub fn substitute_range(
+        &mut self,
+        start_line: usize,
+        end_line: usize,
+        pattern: &str,
+        replacement: &str,
+        global: bool,
+    ) -> bool {
+        if start_line >= self.text_buffer.len() {
+            return false;
+        }
+        let end_line = end_line.min(self.text_buffer.len() - 1);
+        if start_line > end_line {
+            return false;
+        }
         let mut changed = false;
-        for line_str in &mut self.text_buffer {
-            let after = line_str.replace(pattern, replacement);
+        for line_str in &mut self.text_buffer[start_line..=end_line] {
+            let after = if global {
+                line_str.replace(pattern, replacement)
+            } else {
+                line_str.replacen(pattern, replacement, 1)
+            };
             if after != *line_str {
                 *line_str = after;
                 changed = true;
             }
         }
         if changed {
-            self.cursor.1 = floor_char_boundary(&self.text_buffer[self.cursor.0], self.cursor.1);
-            self.modified = true;
-            self.update_counts();
+            let cur_line = self.cursor.0.min(self.text_buffer.len() - 1);
+            self.cursor.0 = cur_line;
+            self.cursor.1 = floor_char_boundary(&self.text_buffer[cur_line], self.cursor.1);
+            self.mark_edited();
         }
         changed
     }
@@ -891,6 +966,7 @@ impl App {
             }
             ":help" => {
                 self.mode = AppMode::HelpMenu;
+                self.help_scroll = 0;
                 self.set_status("");
                 return;
             }
@@ -1029,9 +1105,15 @@ impl App {
             _ => {}
         }
 
-        if let Some(rest) = cmd.strip_prefix(":w") {
+        if cmd == ":w" || cmd == ":w!" {
+            self.save_current_file();
+            self.add_to_history(cmd.to_string());
+            return;
+        }
+
+        if let Some(rest) = cmd.strip_prefix(":w! ").or_else(|| cmd.strip_prefix(":w ")) {
             let rest = rest.trim();
-            if rest.is_empty() || rest == "!" {
+            if rest.is_empty() {
                 self.save_current_file();
             } else {
                 self.save_to_file(rest);
@@ -1062,9 +1144,26 @@ impl App {
             return;
         }
 
+        if let Some(rest) = cmd.strip_prefix(":'<,'>s/") {
+            if let Some((pattern, replacement, global)) = parse_substitute(rest) {
+                let (start_line, end_line) = self.get_visual_range();
+                let changed =
+                    self.substitute_range(start_line, end_line, pattern, replacement, global);
+                self.set_status(if changed {
+                    "Substitution made in selection"
+                } else {
+                    "No substitution made"
+                });
+            } else {
+                self.set_status_error("E486: Invalid substitute pattern");
+            }
+            self.add_to_history(cmd.to_string());
+            return;
+        }
+
         if let Some(rest) = cmd.strip_prefix("%s/").or_else(|| cmd.strip_prefix(":%s/")) {
-            if let Some((pattern, replacement, _global)) = parse_substitute(rest) {
-                let changed = self.substitute_all(pattern, replacement);
+            if let Some((pattern, replacement, global)) = parse_substitute(rest) {
+                let changed = self.substitute_all(pattern, replacement, global);
                 self.set_status(if changed {
                     "Substitution made in entire buffer"
                 } else {
@@ -1092,7 +1191,7 @@ impl App {
             return;
         }
 
-        if let Some(rest) = cmd.strip_prefix(":set") {
+        if let Some(rest) = cmd.strip_prefix(":set ") {
             self.handle_set_command(rest);
             self.add_to_history(cmd.to_string());
             return;
@@ -1148,6 +1247,7 @@ impl App {
                 .or_else(|| part.strip_prefix("ts="))
             {
                 match val.parse::<usize>() {
+                    Ok(0) => self.set_status_error("E521: tabstop must be greater than 0"),
                     Ok(ts) => {
                         self.tab_size = ts;
                         self.set_status(format!("tabstop={}", ts));
@@ -1196,33 +1296,38 @@ impl App {
     }
 
     pub fn save_to_file(&mut self, filename: &str) -> bool {
-        if let Err(e) = self.write_file(filename) {
+        let resolved = normalize_path(&self.project_root(), Path::new(filename));
+        let display_name = resolved.to_string_lossy().into_owned();
+        if let Err(e) = self.write_file(&display_name) {
             self.set_status_error(format!("E303: Unable to open file: {}", e));
             false
         } else {
             self.modified = false;
-            self.file_name = Some(filename.to_string());
+            self.file_name = Some(display_name.clone());
             self.sync_view_to_buffer();
             self.add_to_history(format!("Wrote {} lines", self.line_count));
             self.set_status(format!(
                 "\"{}\" {}L, {}C written",
-                filename, self.line_count, self.char_count
+                display_name, self.line_count, self.char_count
             ));
             if let Some(lsp) = &mut self.lsp {
-                let _ = lsp.did_save(&PathBuf::from(filename));
+                let _ = lsp.did_save(&resolved);
             }
             true
         }
     }
 
     pub fn save_all(&mut self) -> bool {
+        self.sync_view_to_buffer();
         let mut count = 0;
+        let mut untitled_modified = 0;
         let mut failed = false;
         for index in 0..self.buffers.len() {
             if !self.buffers[index].modified {
                 continue;
             }
             let Some(path) = self.buffers[index].path.clone() else {
+                untitled_modified += 1;
                 continue;
             };
             let mut file = std::fs::File::create(&path);
@@ -1253,6 +1358,11 @@ impl App {
         self.sync_buffer_to_view();
         if failed {
             self.set_status_error("E303: One or more buffers could not be written");
+        } else if untitled_modified > 0 {
+            self.set_status(format!(
+                "Saved {} buffer(s); {} untitled buffer(s) need :w <file>",
+                count, untitled_modified
+            ));
         } else {
             self.set_status(format!("Saved {} modified buffer(s)", count));
         }
@@ -1260,16 +1370,18 @@ impl App {
     }
 
     pub fn open_file(&mut self, filename: &str) {
-        let path = PathBuf::from(filename);
-        if let Some(index) = self
-            .buffers
-            .iter()
-            .position(|buffer| buffer.path.as_ref() == Some(&path))
-        {
+        let path = normalize_path(&self.project_root(), Path::new(filename));
+        if let Some(index) = self.buffers.iter().position(|buffer| {
+            buffer
+                .path
+                .as_ref()
+                .is_some_and(|existing| path_matches(existing, &path))
+        }) {
             self.sync_view_to_buffer();
             self.active_tab = index;
             self.sync_buffer_to_view();
             self.set_status(format!("Switched to \"{}\"", filename));
+            self.ensure_lsp_open();
             return;
         }
 
@@ -1348,12 +1460,16 @@ impl App {
         self.active_panel = panel;
         self.set_status(match panel {
             ActivePanel::Editor => "Editor",
-            ActivePanel::Explorer => "File explorer — j/k move, Enter open, Esc editor",
+            ActivePanel::Explorer => {
+                "File explorer — Arrows/j/k move, Enter open, Tab cycle, Esc editor"
+            }
             ActivePanel::Terminal => "Terminal — type to run, Esc returns to editor",
-            ActivePanel::Output => "Task output — Esc returns to editor",
-            ActivePanel::Problems => "Problems — j/k select, Enter jump, Esc editor",
-            ActivePanel::Git => "Git status — Esc returns to editor",
-            ActivePanel::History => "Command history — Esc returns to editor",
+            ActivePanel::Output => "Task output — Tab cycle, Esc returns to editor",
+            ActivePanel::Problems => {
+                "Problems — Arrows/j/k select, Enter jump, Tab cycle, Esc editor"
+            }
+            ActivePanel::Git => "Git status — Tab cycle, Esc returns to editor",
+            ActivePanel::History => "Command history — Tab cycle, Esc returns to editor",
         });
     }
 
@@ -1383,6 +1499,7 @@ impl App {
         self.sync_view_to_buffer();
         self.active_tab = (self.active_tab + 1) % self.buffers.len();
         self.sync_buffer_to_view();
+        self.ensure_lsp_open();
         self.set_status(format!(
             "Buffer {}/{}",
             self.active_tab + 1,
@@ -1398,6 +1515,7 @@ impl App {
         self.sync_view_to_buffer();
         self.active_tab = (self.active_tab + self.buffers.len() - 1) % self.buffers.len();
         self.sync_buffer_to_view();
+        self.ensure_lsp_open();
         self.set_status(format!(
             "Buffer {}/{}",
             self.active_tab + 1,
@@ -1443,17 +1561,28 @@ impl App {
         self.set_status("Buffer closed");
     }
 
-    pub fn jump_to(&mut self, path: &std::path::Path, line: usize, column: usize) {
+    fn jump_to_with(
+        &mut self,
+        path: &std::path::Path,
+        line: usize,
+        col_fn: impl FnOnce(&str) -> usize,
+    ) {
         let name = path.to_string_lossy().into_owned();
         self.open_file(&name);
         self.move_to_line_number(line.max(1));
         let target = self.cursor.0.min(self.text_buffer.len().saturating_sub(1));
-        self.cursor = (
-            target,
-            floor_char_boundary(&self.text_buffer[target], column),
-        );
+        let byte_col = col_fn(&self.text_buffer[target]);
+        self.cursor = (target, byte_col);
         self.scroll_offset = self.cursor.0.saturating_sub(5);
         self.active_panel = ActivePanel::Editor;
+    }
+
+    pub fn jump_to_char_col(&mut self, path: &std::path::Path, line: usize, char_col: usize) {
+        self.jump_to_with(path, line, |s| char_col_to_byte(s, char_col));
+    }
+
+    pub fn jump_to_utf16(&mut self, path: &std::path::Path, line: usize, utf16_col: usize) {
+        self.jump_to_with(path, line, |s| utf16_col_to_byte(s, utf16_col));
     }
 
     pub fn run_task(&mut self, kind: TaskKind) {
@@ -1502,6 +1631,7 @@ impl App {
         }
         if event.kind == TaskKind::Check {
             self.diagnostics = parse_cargo_diagnostics(&event.output, &self.project_root());
+            self.problem_index = 0;
             self.set_status(format!(
                 "{} problem(s) from cargo check",
                 self.diagnostics.len()
@@ -1510,8 +1640,36 @@ impl App {
             self.set_status(self.task_title.clone());
         }
         if event.kind == TaskKind::Fmt {
+            if event.success {
+                self.reload_unmodified_buffers();
+            }
             self.refresh_explorer();
         }
+    }
+
+    fn reload_unmodified_buffers(&mut self) {
+        self.sync_view_to_buffer();
+        for buffer in &mut self.buffers {
+            if buffer.modified {
+                continue;
+            }
+            let Some(path) = buffer.path.as_ref() else {
+                continue;
+            };
+            let Ok(content) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            let trailing_newline = content.ends_with('\n');
+            let mut lines: Vec<String> = content.lines().map(String::from).collect();
+            if lines.is_empty() {
+                lines.push(String::new());
+            }
+            buffer.lines = lines;
+            buffer.trailing_newline = trailing_newline;
+            buffer.cursor.0 = buffer.cursor.0.min(buffer.lines.len().saturating_sub(1));
+            buffer.cursor.1 = floor_char_boundary(&buffer.lines[buffer.cursor.0], buffer.cursor.1);
+        }
+        self.sync_buffer_to_view();
     }
 
     pub fn refresh_git(&mut self) {
@@ -1526,7 +1684,11 @@ impl App {
         let Some(diagnostic) = self.diagnostics.get(index).cloned() else {
             return;
         };
-        self.jump_to(&diagnostic.path, diagnostic.line, diagnostic.column);
+        self.jump_to_char_col(
+            &diagnostic.path,
+            diagnostic.line,
+            diagnostic.column.saturating_sub(1),
+        );
         self.set_status(diagnostic.message);
     }
 
@@ -1551,14 +1713,28 @@ impl App {
         }
     }
 
-    pub fn notify_lsp_open(&mut self) {
-        let Some(name) = self.file_name.clone() else {
+    fn resolved_rust_path(&self) -> Option<PathBuf> {
+        let name = self.file_name.as_deref()?;
+        if !name.ends_with(".rs") {
+            return None;
+        }
+        Some(normalize_path(&self.project_root(), Path::new(name)))
+    }
+
+    pub fn ensure_lsp_open(&mut self) {
+        let Some(path) = self.resolved_rust_path() else {
             return;
         };
-        if !name.ends_with(".rs") {
-            return;
+        let already_open = self.lsp.as_ref().is_some_and(|lsp| lsp.has_opened(&path));
+        if self.lsp.is_some() && !already_open {
+            self.notify_lsp_open();
         }
-        let path = PathBuf::from(&name);
+    }
+
+    pub fn notify_lsp_open(&mut self) {
+        let Some(path) = self.resolved_rust_path() else {
+            return;
+        };
         let text = self.buffer_text();
         let Some(lsp) = &mut self.lsp else {
             return;
@@ -1569,13 +1745,9 @@ impl App {
     }
 
     pub fn notify_lsp_change(&mut self) {
-        let Some(name) = self.file_name.clone() else {
+        let Some(path) = self.resolved_rust_path() else {
             return;
         };
-        if !name.ends_with(".rs") {
-            return;
-        }
-        let path = PathBuf::from(&name);
         let text = self.buffer_text();
         let Some(lsp) = &mut self.lsp else {
             return;
@@ -1586,17 +1758,14 @@ impl App {
     }
 
     fn lsp_position(&self) -> Option<(PathBuf, usize, usize)> {
-        let name = self.file_name.clone()?;
-        if !name.ends_with(".rs") {
-            return None;
-        }
+        let path = self.resolved_rust_path()?;
         let line_text = self
             .text_buffer
             .get(self.cursor.0)
             .map(String::as_str)
             .unwrap_or("");
         let col = lsp::byte_col_to_utf16(line_text, self.cursor.1);
-        Some((PathBuf::from(name), self.cursor.0, col))
+        Some((path, self.cursor.0, col))
     }
 
     pub fn request_completion(&mut self) {
@@ -1678,15 +1847,15 @@ impl App {
                     }
                 }
                 LspMessage::Response { id, result, error } => {
-                    if let Some(error) = error {
-                        self.set_status_error(format!("LSP: {}", error));
-                        continue;
-                    }
                     let Some(pending) = self.pending_lsp.take() else {
                         continue;
                     };
                     if pending.id != id {
                         self.pending_lsp = Some(pending);
+                        continue;
+                    }
+                    if let Some(error) = error {
+                        self.set_status_error(format!("LSP: {}", error));
                         continue;
                     }
                     let result = result.unwrap_or(serde_json::Value::Null);
@@ -1713,9 +1882,51 @@ impl App {
         self.completions = items
             .iter()
             .filter_map(|item| {
-                item.get("label")
+                let label = item
+                    .get("label")
                     .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)
+                    .map(str::to_string)?;
+                let text_edit = item.get("textEdit");
+                let new_text = text_edit
+                    .and_then(|edit| edit.get("newText"))
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| item.get("insertText").and_then(serde_json::Value::as_str))
+                    .unwrap_or(&label)
+                    .to_string();
+                let (replace_start_utf16, replace_end_utf16) =
+                    if let Some(range) = text_edit.and_then(|edit| edit.get("range")) {
+                        let start = range.get("start");
+                        let end = range.get("end");
+                        let start_line = start
+                            .and_then(|s| s.get("line"))
+                            .and_then(serde_json::Value::as_u64)
+                            .map(|n| n as usize);
+                        let end_line = end
+                            .and_then(|e| e.get("line"))
+                            .and_then(serde_json::Value::as_u64)
+                            .map(|n| n as usize);
+                        if start_line == Some(self.cursor.0) && end_line == Some(self.cursor.0) {
+                            (
+                                start
+                                    .and_then(|s| s.get("character"))
+                                    .and_then(serde_json::Value::as_u64)
+                                    .map(|n| n as usize),
+                                end.and_then(|e| e.get("character"))
+                                    .and_then(serde_json::Value::as_u64)
+                                    .map(|n| n as usize),
+                            )
+                        } else {
+                            (None, None)
+                        }
+                    } else {
+                        (None, None)
+                    };
+                Some(CompletionOption {
+                    label,
+                    insert_text: new_text,
+                    replace_start_utf16,
+                    replace_end_utf16,
+                })
             })
             .take(50)
             .collect();
@@ -1730,11 +1941,38 @@ impl App {
         if self.completions.is_empty() {
             return false;
         }
-        let Some(text) = self.completions.get(self.completion_index).cloned() else {
+        let Some(item) = self.completions.get(self.completion_index).cloned() else {
             return false;
         };
-        for ch in text.chars() {
-            self.insert_at_cursor(ch);
+        let (line_idx, col) = self.cursor;
+        if line_idx < self.text_buffer.len() {
+            let line = &mut self.text_buffer[line_idx];
+            let cursor_byte = floor_char_boundary(line, col);
+            let (start_byte, end_byte) = match (item.replace_start_utf16, item.replace_end_utf16) {
+                (Some(s), Some(e)) => (
+                    utf16_col_to_byte(line, s),
+                    utf16_col_to_byte(line, e).max(utf16_col_to_byte(line, s)),
+                ),
+                _ => {
+                    let mut prefix_start = cursor_byte;
+                    for (idx, ch) in line[..cursor_byte].char_indices().rev() {
+                        if ch.is_alphanumeric() || ch == '_' {
+                            prefix_start = idx;
+                        } else {
+                            break;
+                        }
+                    }
+                    let prefix = &line[prefix_start..cursor_byte];
+                    if !prefix.is_empty() && item.insert_text.starts_with(prefix) {
+                        (prefix_start, cursor_byte)
+                    } else {
+                        (cursor_byte, cursor_byte)
+                    }
+                }
+            };
+            line.replace_range(start_byte..end_byte, &item.insert_text);
+            self.cursor = (line_idx, start_byte + item.insert_text.len());
+            self.mark_edited();
         }
         self.notify_lsp_change();
         self.completions.clear();
@@ -1745,6 +1983,7 @@ impl App {
 
     fn apply_definition(&mut self, result: &serde_json::Value) {
         let location = match result {
+            serde_json::Value::Null => None,
             serde_json::Value::Array(items) => items.first(),
             other => Some(other),
         };
@@ -1752,7 +1991,11 @@ impl App {
             self.set_status_error("No definition found");
             return;
         };
-        let Some(uri) = location.get("uri").and_then(serde_json::Value::as_str) else {
+        let uri = location
+            .get("uri")
+            .or_else(|| location.get("targetUri"))
+            .and_then(serde_json::Value::as_str);
+        let Some(uri) = uri else {
             self.set_status_error("Definition has no file");
             return;
         };
@@ -1760,7 +2003,11 @@ impl App {
             self.set_status_error("Definition path is not a local file");
             return;
         };
-        let start = location.get("range").and_then(|r| r.get("start"));
+        let start = location
+            .get("range")
+            .or_else(|| location.get("targetSelectionRange"))
+            .or_else(|| location.get("targetRange"))
+            .and_then(|r| r.get("start"));
         let line = start
             .and_then(|s| s.get("line"))
             .and_then(serde_json::Value::as_u64)
@@ -1769,7 +2016,7 @@ impl App {
             .and_then(|s| s.get("character"))
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0) as usize;
-        self.jump_to(&path, line + 1, character);
+        self.jump_to_utf16(&path, line + 1, character);
         self.set_status(format!("Jumped to {}", path.display()));
     }
 
@@ -1877,7 +2124,11 @@ fn parse_cargo_diagnostics(output: &str, root: &std::path::Path) -> Vec<Diagnost
             .and_then(serde_json::Value::as_str)
             .unwrap_or("")
             .to_string();
-        let severity = match message.get("level").and_then(serde_json::Value::as_str) {
+        let level = message.get("level").and_then(serde_json::Value::as_str);
+        if level == Some("failure-note") {
+            continue;
+        }
+        let severity = match level {
             Some("error") => Severity::Error,
             Some("warning") => Severity::Warning,
             _ => Severity::Other,
@@ -1885,15 +2136,24 @@ fn parse_cargo_diagnostics(output: &str, root: &std::path::Path) -> Vec<Diagnost
         let Some(spans) = message.get("spans").and_then(serde_json::Value::as_array) else {
             continue;
         };
+        let has_primary = spans.iter().any(|span| {
+            span.get("is_primary")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        });
         for span in spans {
+            if has_primary
+                && !span
+                    .get("is_primary")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            {
+                continue;
+            }
             let Some(file_name) = span.get("file_name").and_then(serde_json::Value::as_str) else {
                 continue;
             };
-            let path = if std::path::Path::new(file_name).is_absolute() {
-                PathBuf::from(file_name)
-            } else {
-                root.join(file_name)
-            };
+            let path = normalize_path(root, Path::new(file_name));
             diagnostics.push(Diagnostic {
                 path: path.clone(),
                 line: span
@@ -1957,12 +2217,25 @@ pub fn run() {
             break;
         }
         if let Ok(true) = crossterm::event::poll(std::time::Duration::from_millis(100)) {
-            if let Ok(crossterm::event::Event::Key(key)) = crossterm::event::read() {
-                if key.kind == crossterm::event::KeyEventKind::Press
-                    && event_handler::handle_key(&mut app, key)
-                {
+            let mut should_exit = false;
+            loop {
+                if let Ok(crossterm::event::Event::Key(key)) = crossterm::event::read() {
+                    if matches!(
+                        key.kind,
+                        crossterm::event::KeyEventKind::Press
+                            | crossterm::event::KeyEventKind::Repeat
+                    ) && event_handler::handle_key(&mut app, key)
+                    {
+                        should_exit = true;
+                        break;
+                    }
+                }
+                if !matches!(crossterm::event::poll(std::time::Duration::ZERO), Ok(true)) {
                     break;
                 }
+            }
+            if should_exit {
+                break;
             }
         }
     }
@@ -2113,5 +2386,50 @@ mod tests {
         app.execute_ex_command(":q");
         assert!(app.error_message.is_some());
         assert!(app.running);
+    }
+
+    #[test]
+    fn w_and_set_reject_unknown_suffixes_and_zero_tabstop() {
+        let mut app = App::new();
+        app.execute_ex_command(":who");
+        assert!(app.error_message.is_some());
+        app.clear_error();
+
+        app.execute_ex_command(":setfoo");
+        assert!(app.error_message.is_some());
+        app.clear_error();
+
+        app.execute_ex_command(":set tabstop=0");
+        assert!(app.error_message.is_some());
+        assert_eq!(app.tab_size, 4);
+    }
+
+    #[test]
+    fn substitute_non_global_and_visual_range_work() {
+        let mut app = App::new();
+        app.text_buffer = vec!["a a".to_string(), "a a".to_string(), "a a".to_string()];
+        app.execute_ex_command(":%s/a/b/");
+        assert_eq!(app.text_buffer, vec!["b a", "b a", "b a"]);
+
+        app.visual_start = (0, 0);
+        app.cursor = (1, 0);
+        app.execute_ex_command(":'<,'>s/b/c/g");
+        assert_eq!(app.text_buffer, vec!["c a", "c a", "b a"]);
+    }
+
+    #[test]
+    fn accept_completion_replaces_typed_prefix() {
+        let mut app = App::new();
+        app.text_buffer = vec!["    pr".to_string()];
+        app.cursor = (0, 6);
+        app.completions = vec![CompletionOption {
+            label: "println!(...)".to_string(),
+            insert_text: "println!".to_string(),
+            replace_start_utf16: None,
+            replace_end_utf16: None,
+        }];
+        assert!(app.accept_completion());
+        assert_eq!(app.text_buffer[0], "    println!");
+        assert_eq!(app.cursor, (0, "    println!".len()));
     }
 }

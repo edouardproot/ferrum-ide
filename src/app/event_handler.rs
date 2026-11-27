@@ -32,28 +32,58 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         return request_quit(app);
     }
 
-    let modified_before = app.modified;
+    let revision_before = app.revision;
     let mut should_quit = false;
     match app.mode {
+        AppMode::HelpMenu => handle_help_menu(app, key),
+        AppMode::Search => handle_search_mode(app, key),
+        AppMode::ExCommand => should_quit = handle_ex_mode(app, key),
+        _ if app.active_panel != ActivePanel::Editor => handle_panel_key(app, key),
         AppMode::Normal => should_quit = handle_normal_mode(app, key),
         AppMode::Insert => handle_insert_mode(app, key),
         AppMode::Visual => handle_visual_mode(app, key),
-        AppMode::Search => handle_search_mode(app, key),
-        AppMode::ExCommand => should_quit = handle_ex_mode(app, key),
-        AppMode::HelpMenu => handle_help_menu(app, key),
     }
 
     app.sync_view_to_buffer();
-    let edited = app.modified != modified_before
-        || app.mode == AppMode::Insert
-        || matches!(
-            key.code,
-            KeyCode::Backspace | KeyCode::Delete | KeyCode::Enter | KeyCode::Tab
-        );
-    if edited && app.lsp.is_some() {
+    if app.revision != revision_before && app.lsp.is_some() {
         app.notify_lsp_change();
     }
     should_quit
+}
+
+fn handle_ctrl_shortcut(app: &mut App, key: KeyEvent, allow_editor_only: bool) -> bool {
+    if !key.modifiers.contains(KeyModifiers::CONTROL)
+        || key
+            .modifiers
+            .intersects(KeyModifiers::ALT | KeyModifiers::SUPER | KeyModifiers::META)
+    {
+        return false;
+    }
+
+    match key.code {
+        KeyCode::Char('e') => {
+            app.refresh_explorer();
+            app.set_panel(ActivePanel::Explorer);
+        }
+        KeyCode::Char('t') => app.set_panel(ActivePanel::Terminal),
+        KeyCode::Char('p') => app.set_panel(ActivePanel::Problems),
+        KeyCode::Char('g') => app.refresh_git(),
+        KeyCode::Char('b') => app.run_task(TaskKind::Build),
+        KeyCode::Char('r') => app.run_task(TaskKind::Run),
+        KeyCode::Char('h') => app.set_panel(ActivePanel::History),
+        KeyCode::Char('s') => {
+            app.save_current_file();
+        }
+        KeyCode::Char(' ') | KeyCode::Null if allow_editor_only => app.request_completion(),
+        KeyCode::Char(']') if allow_editor_only => app.request_definition(),
+        KeyCode::Char('u') if allow_editor_only => app.set_status("Undo not yet implemented"),
+        KeyCode::Char('v') if allow_editor_only => {
+            app.mode = AppMode::Visual;
+            app.visual_start = app.cursor;
+        }
+        _ => return false,
+    }
+    true
 }
 
 fn cycle_panel(app: &mut App) {
@@ -79,10 +109,38 @@ fn cycle_panel(app: &mut App) {
 }
 
 fn handle_panel_key(app: &mut App, key: KeyEvent) {
+    if app.active_panel == ActivePanel::Terminal {
+        if key.code == KeyCode::Esc
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            app.set_panel(ActivePanel::Editor);
+        } else {
+            app.terminal.send_key(key);
+        }
+        return;
+    }
+
+    if handle_ctrl_shortcut(app, key, false) {
+        return;
+    }
+
+    if key.code == KeyCode::Tab {
+        cycle_panel(app);
+        return;
+    }
+
+    if key.code == KeyCode::Char(':') && is_text_key(&key) {
+        app.mode = AppMode::ExCommand;
+        app.ex_command = ":".to_string();
+        return;
+    }
+
     match app.active_panel {
         ActivePanel::Explorer => match key.code {
-            KeyCode::Down => app.explorer.move_selection(1),
-            KeyCode::Up => app.explorer.move_selection(-1),
+            KeyCode::Down | KeyCode::Char('j') => app.explorer.move_selection(1),
+            KeyCode::Up | KeyCode::Char('k') => app.explorer.move_selection(-1),
             KeyCode::Enter => app.explorer_open_selected(),
             KeyCode::Left => app.explorer.parent(),
             KeyCode::Right | KeyCode::Char(' ') => app.explorer.toggle(),
@@ -90,24 +148,13 @@ fn handle_panel_key(app: &mut App, key: KeyEvent) {
             KeyCode::Esc => app.set_panel(ActivePanel::Editor),
             _ => {}
         },
-        ActivePanel::Terminal => {
-            if key.code == KeyCode::Esc
-                && !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-            {
-                app.set_panel(ActivePanel::Editor);
-            } else {
-                app.terminal.send_key(key);
-            }
-        }
         ActivePanel::Problems => match key.code {
-            KeyCode::Down => {
+            KeyCode::Down | KeyCode::Char('j') => {
                 if !app.diagnostics.is_empty() {
                     app.problem_index = (app.problem_index + 1) % app.diagnostics.len();
                 }
             }
-            KeyCode::Up => {
+            KeyCode::Up | KeyCode::Char('k') => {
                 if !app.diagnostics.is_empty() {
                     app.problem_index =
                         (app.problem_index + app.diagnostics.len() - 1) % app.diagnostics.len();
@@ -122,7 +169,7 @@ fn handle_panel_key(app: &mut App, key: KeyEvent) {
                 app.set_panel(ActivePanel::Editor);
             }
         }
-        ActivePanel::Editor => {}
+        ActivePanel::Editor | ActivePanel::Terminal => {}
     }
 }
 
@@ -132,27 +179,7 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> bool {
         return false;
     }
 
-    if key
-        .modifiers
-        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
-    {
-        match key.code {
-            KeyCode::Char('e') => app.set_panel(ActivePanel::Explorer),
-            KeyCode::Char('t') => app.set_panel(ActivePanel::Terminal),
-            KeyCode::Char('p') => app.set_panel(ActivePanel::Problems),
-            KeyCode::Char('g') => app.refresh_git(),
-            KeyCode::Char('b') => app.run_task(TaskKind::Build),
-            KeyCode::Char('r') => app.run_task(TaskKind::Run),
-            KeyCode::Char(' ') => app.request_completion(),
-            KeyCode::Char(']') => app.request_definition(),
-            KeyCode::Char('h') => app.set_panel(ActivePanel::History),
-            KeyCode::Char('u') => app.set_status("Undo not yet implemented"),
-            KeyCode::Char('v') => {
-                app.mode = AppMode::Visual;
-                app.visual_start = app.cursor;
-            }
-            _ => {}
-        }
+    if handle_ctrl_shortcut(app, key, true) {
         return false;
     }
 
@@ -162,11 +189,11 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> bool {
 
         KeyCode::Enter | KeyCode::Insert => app.mode = AppMode::Insert,
 
-        KeyCode::Char('/') => {
+        KeyCode::Char('/') if is_text_key(&key) => {
             app.mode = AppMode::Search;
             app.search_query.clear();
         }
-        KeyCode::Char(':') => {
+        KeyCode::Char(':') if is_text_key(&key) => {
             app.mode = AppMode::ExCommand;
             app.ex_command = ":".to_string();
         }
@@ -212,18 +239,8 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> bool {
 }
 
 fn handle_insert_mode(app: &mut App, key: KeyEvent) {
-    if key.modifiers.contains(KeyModifiers::CONTROL) {
-        match key.code {
-            KeyCode::Char(' ') => {
-                app.request_completion();
-                return;
-            }
-            KeyCode::Char(']') => {
-                app.request_definition();
-                return;
-            }
-            _ => {}
-        }
+    if handle_ctrl_shortcut(app, key, true) {
+        return;
     }
 
     if !app.completions.is_empty() {
@@ -237,16 +254,12 @@ fn handle_insert_mode(app: &mut App, key: KeyEvent) {
                 return;
             }
             KeyCode::Up => {
-                if !app.completions.is_empty() {
-                    app.completion_index =
-                        (app.completion_index + app.completions.len() - 1) % app.completions.len();
-                }
+                app.completion_index =
+                    (app.completion_index + app.completions.len() - 1) % app.completions.len();
                 return;
             }
             KeyCode::Down => {
-                if !app.completions.is_empty() {
-                    app.completion_index = (app.completion_index + 1) % app.completions.len();
-                }
+                app.completion_index = (app.completion_index + 1) % app.completions.len();
                 return;
             }
             _ => {}
@@ -258,10 +271,6 @@ fn handle_insert_mode(app: &mut App, key: KeyEvent) {
             app.mode = AppMode::Normal;
             app.move_cursor_left();
         }
-        KeyCode::Char(':') if is_text_key(&key) => {
-            app.mode = AppMode::ExCommand;
-            app.ex_command = ":".to_string();
-        }
         KeyCode::Char(c) if is_text_key(&key) => app.insert_at_cursor(c),
         KeyCode::Enter => app.insert_newline(),
         KeyCode::Backspace => app.delete_backward(),
@@ -269,6 +278,20 @@ fn handle_insert_mode(app: &mut App, key: KeyEvent) {
         KeyCode::Tab => {
             for _ in 0..app.tab_size {
                 app.insert_at_cursor(' ');
+            }
+        }
+        KeyCode::Up => app.move_cursor_up(),
+        KeyCode::Down => app.move_cursor_down(),
+        KeyCode::Left => app.move_cursor_left(),
+        KeyCode::Right => app.move_cursor_right(),
+        KeyCode::PageUp => {
+            for _ in 0..10 {
+                app.move_cursor_up();
+            }
+        }
+        KeyCode::PageDown => {
+            for _ in 0..10 {
+                app.move_cursor_down();
             }
         }
         KeyCode::Home => app.move_cursor_to_line_start(),
@@ -375,8 +398,13 @@ fn handle_help_menu(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc | KeyCode::Enter => {
             app.mode = AppMode::Normal;
+            app.help_scroll = 0;
             app.set_status("");
         }
+        KeyCode::Down | KeyCode::Char('j') => app.help_scroll = app.help_scroll.saturating_add(1),
+        KeyCode::Up | KeyCode::Char('k') => app.help_scroll = app.help_scroll.saturating_sub(1),
+        KeyCode::PageDown => app.help_scroll = app.help_scroll.saturating_add(10),
+        KeyCode::PageUp => app.help_scroll = app.help_scroll.saturating_sub(10),
         _ => {}
     }
 }
@@ -413,5 +441,44 @@ mod tests {
             KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
         );
         assert!(quit);
+    }
+
+    #[test]
+    fn colon_and_arrows_work_in_insert_mode() {
+        let mut app = App::new();
+        for ch in ['s', 't', 'd', ':', ':', 'i', 'o'] {
+            handle_key(&mut app, press(KeyCode::Char(ch)));
+        }
+        assert_eq!(app.mode, AppMode::Insert);
+        assert_eq!(app.text_buffer[0], "std::io");
+
+        handle_key(&mut app, press(KeyCode::Left));
+        handle_key(&mut app, press(KeyCode::Left));
+        handle_key(&mut app, press(KeyCode::Char('X')));
+        assert_eq!(app.text_buffer[0], "std::Xio");
+    }
+
+    #[test]
+    fn ctrl_shortcuts_and_panel_tab_work_from_insert_mode() {
+        let mut app = App::new();
+        assert_eq!(app.mode, AppMode::Insert);
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.active_panel, ActivePanel::Explorer);
+
+        // Typing in Explorer shouldn't mutate the hidden editor buffer.
+        handle_key(&mut app, press(KeyCode::Char('x')));
+        assert_eq!(app.text_buffer[0], "");
+
+        // Tab cycles out of Explorer to Terminal.
+        handle_key(&mut app, press(KeyCode::Tab));
+        assert_eq!(app.active_panel, ActivePanel::Terminal);
+
+        // Esc returns from Terminal back to Editor.
+        handle_key(&mut app, press(KeyCode::Esc));
+        assert_eq!(app.active_panel, ActivePanel::Editor);
     }
 }

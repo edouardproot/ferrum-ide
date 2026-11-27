@@ -69,6 +69,36 @@ fn push(parts: &mut Vec<Span<'static>>, text: String, kind: Kind) {
     parts.push(Span::styled(text, style));
 }
 
+fn char_literal_end(line: &str, start: usize) -> Option<usize> {
+    let rest = line.get(start + 1..)?;
+    let mut chars = rest.char_indices();
+    let (_, first) = chars.next()?;
+    if first == '\\' {
+        let mut escaped = true;
+        for (idx, c) in chars {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if c == '\\' {
+                escaped = true;
+            } else if c == '\'' {
+                return Some(start + 1 + idx + 1);
+            }
+        }
+        None
+    } else if first != '\'' {
+        let (idx, second) = chars.next()?;
+        if second == '\'' {
+            Some(start + 1 + idx + 1)
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
 fn is_ident_char(ch: char) -> bool {
     ch.is_alphanumeric() || ch == '_'
 }
@@ -132,21 +162,22 @@ pub fn highlight(line: &str) -> Vec<Span<'static>> {
         }
 
         if ch == '\'' {
-            let mut end = start + ch.len_utf8();
-            let mut escaped = false;
-            for (idx, c) in line[end..].char_indices() {
-                if escaped {
-                    escaped = false;
-                    continue;
+            if let Some(end) = char_literal_end(line, start) {
+                push(&mut parts, line[start..end].to_string(), Kind::String);
+                while iter.peek().map(|(i, _)| *i < end).unwrap_or(false) {
+                    iter.next();
                 }
-                if c == '\\' {
-                    escaped = true;
-                } else if c == '\'' {
-                    end = end + idx + 1;
+                continue;
+            }
+            let mut end = start + ch.len_utf8();
+            for (idx, c) in line[end..].char_indices() {
+                if is_ident_char(c) {
+                    end = start + ch.len_utf8() + idx + c.len_utf8();
+                } else {
                     break;
                 }
             }
-            push(&mut parts, line[start..end].to_string(), Kind::String);
+            push(&mut parts, line[start..end].to_string(), Kind::Type);
             while iter.peek().map(|(i, _)| *i < end).unwrap_or(false) {
                 iter.next();
             }
@@ -156,8 +187,17 @@ pub fn highlight(line: &str) -> Vec<Span<'static>> {
         if ch.is_ascii_digit() {
             let mut end = start + ch.len_utf8();
             for (idx, c) in line[end..].char_indices() {
-                if c.is_ascii_alphanumeric() || c == '_' || c == '.' {
-                    end = end + idx + c.len_utf8();
+                let abs = start + ch.len_utf8() + idx;
+                if c.is_ascii_alphanumeric()
+                    || c == '_'
+                    || (c == '.'
+                        && !line[abs..].starts_with("..")
+                        && line[abs + 1..]
+                            .chars()
+                            .next()
+                            .is_some_and(|n| n.is_ascii_digit()))
+                {
+                    end = abs + c.len_utf8();
                 } else {
                     break;
                 }
@@ -173,15 +213,15 @@ pub fn highlight(line: &str) -> Vec<Span<'static>> {
             let mut end = start + ch.len_utf8();
             for (idx, c) in line[end..].char_indices() {
                 if is_ident_char(c) {
-                    end = end + idx + c.len_utf8();
+                    end = start + ch.len_utf8() + idx + c.len_utf8();
                 } else {
                     break;
                 }
             }
             let token = &line[start..end];
             if line[end..].starts_with('!') {
+                end += 1;
                 push(&mut parts, format!("{}!", token), Kind::Macro);
-                iter.next();
             } else {
                 push(&mut parts, token.to_string(), Kind::Plain);
             }
@@ -195,4 +235,40 @@ pub fn highlight(line: &str) -> Vec<Span<'static>> {
     }
 
     parts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plain_text(spans: &[Span<'_>]) -> String {
+        spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn macros_do_not_duplicate_bang() {
+        let line = "println!(\"hello {}\", x);";
+        let spans = highlight(line);
+        assert_eq!(plain_text(&spans), line);
+        assert_eq!(spans[0].content.as_ref(), "println!");
+    }
+
+    #[test]
+    fn lifetimes_do_not_bleed_into_strings() {
+        let line = "fn foo<'a, 'b>(x: &'a str) -> &'b str { x }";
+        let spans = highlight(line);
+        assert_eq!(plain_text(&spans), line);
+        let string_color = style_for("", Kind::String).fg;
+        assert!(!spans.iter().any(|s| s.style.fg == string_color));
+    }
+
+    #[test]
+    fn char_literals_and_ranges_highlight_cleanly() {
+        let line = "let c = '\\n'; let r = 1..5; let f = 3.14;";
+        let spans = highlight(line);
+        assert_eq!(plain_text(&spans), line);
+        assert!(spans.iter().any(|s| s.content.as_ref() == "'\\n'"));
+        assert!(spans.iter().any(|s| s.content.as_ref() == "3.14"));
+        assert!(!spans.iter().any(|s| s.content.as_ref() == "1..5"));
+    }
 }
